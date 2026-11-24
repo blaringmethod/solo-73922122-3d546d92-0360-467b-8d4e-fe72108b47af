@@ -200,6 +200,15 @@ class LayerIdItem(BaseModel):
     id: int
 
 
+class ConflictDemoOut(BaseModel):
+    """Copy-paste payloads for the two-trench conflict walkthrough."""
+
+    instructions: str
+    first_batch: dict[str, Any] = Field(description="{area, body} 先提交的一单")
+    second_batch: dict[str, Any] = Field(description="{area, body} 后提交、应被退回的一单")
+    expected: str
+
+
 class DemoSeedOut(BaseModel):
     seeded: bool = Field(description="本次是否实际写入；false 表示已存在演示区")
     areas: list[AreaOut]
@@ -208,6 +217,10 @@ class DemoSeedOut(BaseModel):
     )
     versions: dict[str, int]
     demo_rank_layer: dict[str, Any] | None
+    conflict_demo: ConflictDemoOut | None = Field(
+        default=None,
+        description="两探方相互冲突批次的现成请求体（T1 的 L1 与 T2 的 M1 互指）",
+    )
     suggested_steps: list[str]
 
 

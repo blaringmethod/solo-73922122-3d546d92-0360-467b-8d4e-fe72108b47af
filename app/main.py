@@ -56,11 +56,16 @@ DESCRIPTION = """
   已发布关系。
 * 同一对地层的早晚关系可有多条记录；只要还有一条生效，该关系就仍然成立，
   撤回全部记录后才解除。
+* 提交时先读取最近一次已发布的全区记录并在**写锁之外**查环。若另一探方的
+  整单在此期间先入库，则以它发布后的记录为准，叠加本单的补录与撤证重新
+  判定；两次合起来成环时，后入库的一单整单退回。叠加后若有效早晚关系与
+  上次查环完全相同，直接沿用上次结论。
+* 报环时，环上每条边列出**叠加本单后**仍然有效（或由本单补录）的记录号，
+  包括别区刚发布、替换了佐证的记录号。
 * 提交与核定期间，其他分区照常可提交；查询始终读最近一次已发布的整版关系
   （SQLite WAL 快照），不会看到未提交的中间状态。
-* 若整单生效会形成环，返回 `409`，列出环上的地层与对应记录号。
 
-### /docs 演示：撤证后重查名次
+### /docs 演示一：撤证后重查名次
 1. `POST /demo/seed` 建立演示数据（T1/T2 两个探方）。响应中给出 `M2` 的
    `layer_id`、各区当前 `version`，以及建议步骤。
 2. `GET /ranks/{layer_id}` 查看 `M2`：`earliest_rank=2`、`latest_rank=5`。
@@ -69,6 +74,21 @@ DESCRIPTION = """
 4. 再次提交 T2 批次撤回 `R-T2-001`；重查 `M2` 的 `earliest_rank` 变为 `1`。
 5. 用 T1 的版本调 `POST /areas/T1/batches` 撤回 `R-T1-004`；重查
    `latest_rank` 变为 `6`。
+
+### /docs 演示二：两探方相互冲突的批次
+演示数据中 `L1`（T1）与 `M1`（T2）互不可达，两个探方可以各自提交一条
+方向相反的跨探方记录：
+
+1. `POST /demo/seed`。响应里的 `conflict_demo.first_batch` 与
+   `conflict_demo.second_batch` 已是可直接粘贴的 `{area, body}`（含 `L1`/
+   `M1` 的 id 与提交前版本）。
+2. 把 `conflict_demo.first_batch.body` 提交到
+   `POST /areas/T1/batches`。它单独成立，返回 `201`。
+3. 把 `conflict_demo.second_batch.body`（其中 `base_version` 仍是提交前的
+   T2 版本）提交到 `POST /areas/T2/batches`。两单合起来成环，返回
+   `409 cycle_detected`；`cycle.edges` 同时列出 `R-T1-905`（`M1 → L1`）与
+   `R-T2-905`（`L1 → M1`）。T2 的版本与已发布关系保持不变。
+4. 若先提交 T2、后提交 T1，则退回的是 T1 那一单——先入库者为准，后单退回。
 """
 
 TAGS_METADATA = [

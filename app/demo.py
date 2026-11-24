@@ -229,15 +229,60 @@ def _demo_state(conn: sqlite3.Connection) -> dict[str, Any]:
         },
         "versions": {row["code"]: int(row["version"]) for row in area_rows},
         "demo_rank_layer": None,
+        "conflict_demo": None,
         "suggested_steps": [
             "GET /ranks/{M2.id} -> earliest_rank=2, latest_rank=5",
             "POST /areas/T2/batches with base_version from above, "
             "withdraw R-T2-002 -> rank unchanged",
             "same T2 batch withdraw R-T2-001 -> earliest_rank becomes 1",
             "POST /areas/T1/batches withdraw R-T1-004 -> latest_rank becomes 6",
+            "conflict demo: POST T1 {M1 -> L1} as R-T1-905, then POST T2 "
+            "{L1 -> M1} as R-T2-905 -> second batch rejected with "
+            "409 cycle_detected naming both record numbers",
         ],
     }
     m2 = layer_ids.get("T2", {}).get("M2")
     if m2 is not None:
         state["demo_rank_layer"] = {"id": m2, "area": "T2", "code": "M2"}
+    l1 = layer_ids.get("T1", {}).get("L1")
+    m1 = layer_ids.get("T2", {}).get("M1")
+    if l1 is not None and m1 is not None:
+        t1_version = state["versions"].get("T1")
+        t2_version = state["versions"].get("T2")
+        state["conflict_demo"] = {
+            "instructions": (
+                "先提交 T1，再提交方向相反的 T2；两单合起来成环，后一单退回。"
+                "把下面两个 base_version 都取提交前的值，即可复现。"
+            ),
+            "first_batch": {
+                "area": "T1",
+                "body": {
+                    "base_version": t1_version,
+                    "additions": [
+                        {
+                            "record_number": "R-T1-905",
+                            "earlier_layer_id": m1,
+                            "later_layer_id": l1,
+                        }
+                    ],
+                },
+            },
+            "second_batch": {
+                "area": "T2",
+                "body": {
+                    "base_version": t2_version,
+                    "additions": [
+                        {
+                            "record_number": "R-T2-905",
+                            "earlier_layer_id": l1,
+                            "later_layer_id": m1,
+                        }
+                    ],
+                },
+            },
+            "expected": (
+                "first_batch -> 201; second_batch -> 409 cycle_detected with "
+                "cycle.record_numbers = [\"R-T1-905\", \"R-T2-905\"]"
+            ),
+        }
     return state

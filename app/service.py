@@ -11,18 +11,26 @@ Design notes
 * A record is never deleted.  Withdrawing it sets ``withdrawn_at``.  An edge
   between two layers exists while *at least one* active record states it, which
   is why withdrawing one duplicate record does not yet remove the constraint.
-* Every write holds SQLite's write lock from before the version check until
-  commit, so concurrent submissions are serialised.  Readers use WAL snapshots
-  and keep seeing the last published state while a writer validates.
+* Batch validation and the site-wide cycle check run on a WAL read snapshot
+  *outside* SQLite's write lock, so a long check never blocks other areas from
+  entering evidence.  The write lock is only held for a short consistency
+  check and the atomic apply.
+* If another batch commits between the snapshot and the lock, the submission
+  retries from a fresh snapshot and judges the new published records overlaid
+  with its own additions/withdrawals.  A same-area change is a version
+  conflict instead; nothing is ever applied on a stale basis.
 """
 
 from __future__ import annotations
 
+import hashlib
 import sqlite3
-from collections import Counter, defaultdict
+import threading
+from collections import Counter, OrderedDict, defaultdict
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 from .db import read_transaction, write_transaction
 from .errors import (
@@ -390,6 +398,238 @@ def _active_edges(
     return dict(edges), numbers
 
 
+_CYCLE_CACHE_LIMIT = 512
+_MAX_PUBLISH_ATTEMPTS = 10
+
+
+class _CycleCache:
+    """Bounded LRU cache keyed by the effective edge set.
+
+    A graph's cycle (or acyclicity) depends only on which layer pairs are
+    constrained, not on which record numbers support them.  Reusing the
+    conclusion is therefore safe, and cycle *reporting* is still rebuilt from
+    the current records so a newly swapped-in record number is shown.
+    """
+
+    def __init__(self, limit: int = _CYCLE_CACHE_LIMIT) -> None:
+        self._limit = limit
+        self._items: OrderedDict[bytes, tuple[int, ...] | None] = OrderedDict()
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _key(edges: Iterable[tuple[int, int]]) -> bytes:
+        # Digest rather than the (potentially huge) set itself keeps memory per
+        # entry constant.  blake2b over the sorted pairs is collision-safe for
+        # this purpose: two different edge sets map to the same verdict only
+        # with negligible probability.
+        digest = hashlib.blake2b(digest_size=24)
+        for earlier, later in sorted(edges):
+            digest.update(f"{earlier}:{later};".encode("ascii"))
+        return digest.digest()
+
+    def lookup(
+        self,
+        edges: Iterable[tuple[int, int]],
+        compute: Callable[[], tuple[int, ...] | None],
+    ) -> tuple[int, ...] | None:
+        key = self._key(edges)
+        with self._lock:
+            if key in self._items:
+                self._items.move_to_end(key)
+                return self._items[key]
+        value = compute()
+        with self._lock:
+            self._items[key] = value
+            self._items.move_to_end(key)
+            while len(self._items) > self._limit:
+                self._items.popitem(last=False)
+        return value
+
+    def clear(self) -> None:
+        with self._lock:
+            self._items.clear()
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._items)
+
+
+_CYCLE_CACHE = _CycleCache()
+
+
+def _check_cycle(edges: dict[tuple[int, int], list[int]]) -> list[int] | None:
+    """Return a cycle through the effective edges, reusing a cached verdict."""
+
+    def compute() -> tuple[int, ...] | None:
+        adjacency: dict[int, set[int]] = defaultdict(set)
+        for earlier, later in edges:
+            adjacency[earlier].add(later)
+            adjacency.setdefault(later, set())
+        cycle = find_cycle(sorted(adjacency), adjacency)
+        return tuple(cycle) if cycle is not None else None
+
+    cached = _CYCLE_CACHE.lookup(edges.keys(), compute)
+    return list(cached) if cached is not None else None
+
+
+class _SnapshotChanged(Exception):
+    """Another area published after our read snapshot; retry from fresh data."""
+
+
+@dataclass
+class _PreparedBatch:
+    """A batch validated against one consistent read snapshot.
+
+    Includes the effective edge set (published records overlaid with this
+    batch) that the cycle check ran on.  Nothing here has been written yet.
+    """
+
+    area_id: int
+    area_code: str
+    base_version: int
+    additions: list[dict[str, Any]]
+    withdrawals: list[dict[str, Any]]
+    withdraw_ids: dict[str, int]
+    edges: dict[tuple[int, int], list[int]]
+    numbers: dict[int, str]
+    snapshot_site_version: int = 0
+
+
+def _prepare_batch(
+    conn: sqlite3.Connection,
+    area_code: str,
+    *,
+    base_version: int,
+    additions: list[dict[str, Any]],
+    withdrawals: list[dict[str, Any]],
+) -> _PreparedBatch:
+    """Validate a batch and build its prospective graph, without writing.
+
+    Runs inside the caller's read transaction, so the version check, record
+    lookups and overlay all describe one published snapshot.
+    """
+
+    area = _area_row(conn, area_code)
+    current_version = int(area["version"])
+    if current_version != base_version:
+        raise VersionConflictError(
+            "分区版本已变更，整单退回；请重新读取后提交",
+            base_version=base_version,
+            current_version=current_version,
+        )
+
+    errors: list[str] = []
+
+    add_numbers = [item["record_number"] for item in additions]
+    withdraw_numbers = [item["record_number"] for item in withdrawals]
+    duplicate_adds = sorted(
+        number for number, count in Counter(add_numbers).items() if count > 1
+    )
+    duplicate_withdrawals = sorted(
+        number for number, count in Counter(withdraw_numbers).items() if count > 1
+    )
+    overlap = sorted(set(add_numbers) & set(withdraw_numbers))
+    if duplicate_adds:
+        errors.append(f"批次内补录记录号重复: {duplicate_adds}")
+    if duplicate_withdrawals:
+        errors.append(f"批次内撤回记录号重复: {duplicate_withdrawals}")
+    if overlap:
+        errors.append(f"同一记录号不能在批次内又补录又撤回: {overlap}")
+
+    # Record numbers are historical identifiers: withdrawn numbers may not be
+    # reused, keeping citations in the archive unambiguous.
+    existing_numbers: dict[str, sqlite3.Row] = {}
+    if add_numbers:
+        placeholders = ",".join("?" for _ in add_numbers)
+        for row in conn.execute(
+            f"SELECT id, record_number, withdrawn_at FROM records "
+            f"WHERE area_id = ? AND record_number IN ({placeholders})",
+            [area["id"], *add_numbers],
+        ):
+            existing_numbers[row["record_number"]] = row
+    reused = sorted(existing_numbers)
+    if reused:
+        errors.append(
+            "记录号在分区内已存在（含已撤回，记录号不可复用）: "
+            f"{reused}"
+        )
+
+    # Endpoints must exist; relations may join layers of other areas because
+    # the archive merges trench sequences.
+    endpoint_ids = {item["earlier_layer_id"] for item in additions} | {
+        item["later_layer_id"] for item in additions
+    }
+    existing_layers: set[int] = set()
+    if endpoint_ids:
+        id_list = sorted(endpoint_ids)
+        placeholders = ",".join("?" for _ in id_list)
+        existing_layers = {
+            int(row["id"])
+            for row in conn.execute(
+                f"SELECT id FROM layers WHERE id IN ({placeholders})", id_list
+            )
+        }
+    missing_layers = sorted(endpoint_ids - existing_layers)
+    if missing_layers:
+        errors.append(f"引用了不存在的地层 ID: {missing_layers}")
+
+    # Active records targeted by withdrawals.
+    withdraw_rows: dict[str, sqlite3.Row] = {}
+    if withdraw_numbers:
+        placeholders = ",".join("?" for _ in withdraw_numbers)
+        for row in conn.execute(
+            f"SELECT id, record_number, withdrawn_at FROM records "
+            f"WHERE area_id = ? AND record_number IN ({placeholders})",
+            [area["id"], *withdraw_numbers],
+        ):
+            withdraw_rows[row["record_number"]] = row
+    missing_or_inactive = sorted(
+        number
+        for number in withdraw_numbers
+        if number not in withdraw_rows
+        or withdraw_rows[number]["withdrawn_at"] is not None
+    )
+    if missing_or_inactive:
+        errors.append(
+            f"以下记录号在该分区不存在或已撤回，无法撤回: "
+            f"{missing_or_inactive}"
+        )
+
+    if errors:
+        raise BatchValidationError("批次校验失败，整单未生效", errors=errors)
+
+    # Hypothetical active graph after this batch.
+    edges, numbers = _active_edges(conn)
+    record_pair = {rid: pair for pair, rids in edges.items() for rid in rids}
+    for number in withdraw_numbers:
+        rid = int(withdraw_rows[number]["id"])
+        pair = record_pair.pop(rid, None)
+        if pair is not None:
+            edges[pair] = [item for item in edges[pair] if item != rid]
+            if not edges[pair]:
+                edges.pop(pair, None)
+
+    for index, item in enumerate(additions, start=1):
+        # Negative placeholder ids distinguish not-yet-inserted records.
+        synthetic_id = -index
+        pair = (item["earlier_layer_id"], item["later_layer_id"])
+        edges.setdefault(pair, []).append(synthetic_id)
+        numbers[synthetic_id] = item["record_number"]
+
+    return _PreparedBatch(
+        area_id=int(area["id"]),
+        area_code=area_code,
+        base_version=base_version,
+        additions=additions,
+        withdrawals=withdrawals,
+        withdraw_ids={
+            number: int(withdraw_rows[number]["id"]) for number in withdraw_numbers
+        },
+        edges=edges,
+        numbers=numbers,
+    )
+
+
 def _cycle_payload(
     conn: sqlite3.Connection,
     cycle_nodes: list[int],
@@ -422,6 +662,115 @@ def _cycle_payload(
     }
 
 
+def _apply_prepared(
+    conn: sqlite3.Connection,
+    prepared: _PreparedBatch,
+    *,
+    note: str | None,
+    now: str,
+) -> dict[str, Any]:
+    """Verify the snapshot is still current under the write lock, then apply.
+
+    The write lock is acquired only now.  The only read done under it is a
+    constant-time check of the published site version; the site-wide record
+    scan and cycle analysis already happened outside the lock.  If anything
+    was published in between, ``_SnapshotChanged`` asks the caller to retry
+    from a fresh snapshot rather than apply a stale conclusion.
+    """
+
+    area = _area_row(conn, prepared.area_code)
+    current_version = int(area["version"])
+    if current_version != prepared.base_version:
+        raise VersionConflictError(
+            "分区版本已变更，整单退回；请重新读取后提交",
+            base_version=prepared.base_version,
+            current_version=current_version,
+        )
+    if _site_version(conn) != prepared.snapshot_site_version:
+        # Another area published after our snapshot: the graph we checked may
+        # no longer be the published graph.  Re-validate against the new one.
+        raise _SnapshotChanged()
+
+    cursor = conn.execute(
+        """
+        INSERT INTO batches
+            (area_id, base_version, area_version, site_version,
+             additions_count, withdrawals_count, relation_count, note, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            prepared.area_id,
+            prepared.base_version,
+            current_version + 1,
+            0,
+            len(prepared.additions),
+            len(prepared.withdrawals),
+            len(prepared.edges),
+            note,
+            now,
+        ),
+    )
+    batch_id = int(cursor.lastrowid)
+
+    added_ids: list[int] = []
+    for item in prepared.additions:
+        cur = conn.execute(
+            """
+            INSERT INTO records
+                (area_id, record_number, earlier_layer_id, later_layer_id,
+                 created_by_batch_id, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                prepared.area_id,
+                item["record_number"],
+                item["earlier_layer_id"],
+                item["later_layer_id"],
+                batch_id,
+                now,
+            ),
+        )
+        added_ids.append(int(cur.lastrowid))
+
+    withdrawn_ids: list[int] = []
+    for withdrawal in prepared.withdrawals:
+        record_id = prepared.withdraw_ids[withdrawal["record_number"]]
+        cur = conn.execute(
+            """
+            UPDATE records
+            SET withdrawn_at = ?, withdrawn_by_batch_id = ?,
+                withdrawal_reason = ?
+            WHERE id = ? AND withdrawn_at IS NULL
+            """,
+            (now, batch_id, withdrawal.get("reason"), record_id),
+        )
+        if cur.rowcount != 1:  # pragma: no cover - guarded by the snapshot check
+            raise _SnapshotChanged()
+        withdrawn_ids.append(record_id)
+
+    conn.execute(
+        "UPDATE areas SET version = version + 1 WHERE id = ?", (prepared.area_id,)
+    )
+    new_site_version = _bump_site_version(conn)
+    conn.execute(
+        "UPDATE batches SET site_version = ? WHERE id = ?",
+        (new_site_version, batch_id),
+    )
+
+    return {
+        "batch_id": batch_id,
+        "area_code": prepared.area_code,
+        "base_version": prepared.base_version,
+        "area_version": current_version + 1,
+        "site_version": new_site_version,
+        "note": note,
+        "created_at": now,
+        "additions": _fetch_records_by_ids(conn, added_ids),
+        "withdrawals": _fetch_records_by_ids(conn, withdrawn_ids),
+        "effective_relation_count": len(prepared.edges),
+    }
+
+
 def submit_batch(
     db: DB,
     area_code: str,
@@ -432,226 +781,66 @@ def submit_batch(
     note: str | None,
     busy_timeout_ms: int,
 ) -> dict[str, Any]:
-    """Apply a whole batch atomically or reject it whole."""
+    """Apply a whole batch atomically or reject it whole.
 
-    now = utc_now()
-    try:
-        with write_transaction(db, busy_timeout_ms) as conn:
-            area = _area_row(conn, area_code)
-            current_version = int(area["version"])
-            if current_version != base_version:
-                raise VersionConflictError(
-                    "分区版本已变更，整单退回；请重新读取后提交",
+    Phase 1 (read snapshot, no write lock): validate the version, record
+    numbers and endpoints, read the site-wide active records, overlay this
+    batch, and run the cycle check.  Phase 2 (write lock): re-check the area
+    version and that no other area published since the snapshot, then write.
+    If another area did publish first, phase 1 is repeated against its
+    published records — the second batch is judged on the combined graph and
+    is rejected if the combination is cyclic.
+    """
+
+    for _attempt in range(_MAX_PUBLISH_ATTEMPTS):
+        now = utc_now()
+        try:
+            with read_transaction(db, busy_timeout_ms) as read_conn:
+                prepared = _prepare_batch(
+                    read_conn,
+                    area_code,
                     base_version=base_version,
-                    current_version=current_version,
+                    additions=additions,
+                    withdrawals=withdrawals,
                 )
-
-            errors: list[str] = []
-
-            add_numbers = [item["record_number"] for item in additions]
-            withdraw_numbers = [item["record_number"] for item in withdrawals]
-            duplicate_adds = sorted(
-                number
-                for number, count in Counter(add_numbers).items()
-                if count > 1
-            )
-            duplicate_withdrawals = sorted(
-                number
-                for number, count in Counter(withdraw_numbers).items()
-                if count > 1
-            )
-            overlap = sorted(set(add_numbers) & set(withdraw_numbers))
-            if duplicate_adds:
-                errors.append(f"批次内补录记录号重复: {duplicate_adds}")
-            if duplicate_withdrawals:
-                errors.append(f"批次内撤回记录号重复: {duplicate_withdrawals}")
-            if overlap:
-                errors.append(f"同一记录号不能在批次内又补录又撤回: {overlap}")
-
-            # Record numbers are historical identifiers: withdrawn numbers may
-            # not be reused, keeping citations in the archive unambiguous.
-            existing_numbers: dict[str, sqlite3.Row] = {}
-            if add_numbers:
-                placeholders = ",".join("?" for _ in add_numbers)
-                for row in conn.execute(
-                    f"SELECT id, record_number, withdrawn_at FROM records "
-                    f"WHERE area_id = ? AND record_number IN ({placeholders})",
-                    [area["id"], *add_numbers],
-                ):
-                    existing_numbers[row["record_number"]] = row
-            reused = sorted(existing_numbers)
-            if reused:
-                errors.append(
-                    "记录号在分区内已存在（含已撤回，记录号不可复用）: "
-                    f"{reused}"
-                )
-
-            # Endpoints must exist; relations may join layers of other areas
-            # because the archive merges trench sequences.
-            endpoint_ids = {item["earlier_layer_id"] for item in additions} | {
-                item["later_layer_id"] for item in additions
-            }
-            existing_layers: set[int] = set()
-            if endpoint_ids:
-                id_list = sorted(endpoint_ids)
-                placeholders = ",".join("?" for _ in id_list)
-                existing_layers = {
-                    int(row["id"])
-                    for row in conn.execute(
-                        f"SELECT id FROM layers WHERE id IN ({placeholders})", id_list
+                prepared.snapshot_site_version = _site_version(read_conn)
+                cycle_nodes = _check_cycle(prepared.edges)
+                if cycle_nodes is not None:
+                    data = _cycle_payload(
+                        read_conn, cycle_nodes, prepared.edges, prepared.numbers
                     )
-                }
-            missing_layers = sorted(endpoint_ids - existing_layers)
-            if missing_layers:
-                errors.append(f"引用了不存在的地层 ID: {missing_layers}")
-
-            # Active records targeted by withdrawals.
-            withdraw_rows: dict[str, sqlite3.Row] = {}
-            if withdraw_numbers:
-                placeholders = ",".join("?" for _ in withdraw_numbers)
-                for row in conn.execute(
-                    f"SELECT id, record_number, withdrawn_at FROM records "
-                    f"WHERE area_id = ? AND record_number IN ({placeholders})",
-                    [area["id"], *withdraw_numbers],
-                ):
-                    withdraw_rows[row["record_number"]] = row
-            missing_or_inactive = sorted(
-                number
-                for number in withdraw_numbers
-                if number not in withdraw_rows
-                or withdraw_rows[number]["withdrawn_at"] is not None
-            )
-            if missing_or_inactive:
-                errors.append(
-                    "以下记录号在该分区不存在或已撤回，无法撤回: "
-                    f"{missing_or_inactive}"
-                )
-
-            if errors:
-                raise BatchValidationError("批次校验失败，整单未生效", errors=errors)
-
-            # Hypothetical active graph after this batch.
-            edges, numbers = _active_edges(conn)
-            record_pair = {
-                rid: pair for pair, rids in edges.items() for rid in rids
-            }
-            for number in withdraw_numbers:
-                rid = int(withdraw_rows[number]["id"])
-                pair = record_pair.pop(rid, None)
-                if pair is not None:
-                    edges[pair] = [item for item in edges[pair] if item != rid]
-                    if not edges[pair]:
-                        edges.pop(pair, None)
-
-            for index, item in enumerate(additions, start=1):
-                # Negative placeholder ids distinguish not-yet-inserted records.
-                synthetic_id = -index
-                pair = (item["earlier_layer_id"], item["later_layer_id"])
-                edges.setdefault(pair, []).append(synthetic_id)
-                numbers[synthetic_id] = item["record_number"]
-
-            adjacency: dict[int, set[int]] = defaultdict(set)
-            for (earlier, later) in edges:
-                adjacency[earlier].add(later)
-                adjacency.setdefault(later, set())
-
-            cycle_nodes = find_cycle(sorted(adjacency), adjacency)
-            if cycle_nodes is not None:
-                data = _cycle_payload(conn, cycle_nodes, edges, numbers)
-                raise CycleDetectedError(
-                    "批次生效后会形成地层先后环，整单退回", cycle=data
-                )
-
-            cursor = conn.execute(
-                """
-                INSERT INTO batches
-                    (area_id, base_version, area_version, site_version,
-                     additions_count, withdrawals_count, relation_count, note, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    area["id"],
-                    base_version,
-                    current_version + 1,
-                    0,
-                    len(additions),
-                    len(withdrawals),
-                    len(edges),
-                    note,
-                    now,
-                ),
-            )
-            batch_id = int(cursor.lastrowid)
-
-            added_ids: list[int] = []
-            for item in additions:
-                cur = conn.execute(
-                    """
-                    INSERT INTO records
-                        (area_id, record_number, earlier_layer_id, later_layer_id,
-                         created_by_batch_id, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        area["id"],
-                        item["record_number"],
-                        item["earlier_layer_id"],
-                        item["later_layer_id"],
-                        batch_id,
-                        now,
-                    ),
-                )
-                added_ids.append(int(cur.lastrowid))
-
-            withdrawn_ids: list[int] = []
-            for withdrawal in withdrawals:
-                row = withdraw_rows[withdrawal["record_number"]]
-                cur = conn.execute(
-                    """
-                    UPDATE records
-                    SET withdrawn_at = ?, withdrawn_by_batch_id = ?,
-                        withdrawal_reason = ?
-                    WHERE id = ? AND withdrawn_at IS NULL
-                    """,
-                    (now, batch_id, withdrawal.get("reason"), row["id"]),
-                )
-                if cur.rowcount != 1:  # pragma: no cover - write lock prevents this
-                    raise ConflictError(
-                        f"记录 {withdrawal['record_number']!r} 状态已变化，整单退回"
+                    raise CycleDetectedError(
+                        "批次生效后会形成地层先后环，整单退回", cycle=data
                     )
-                withdrawn_ids.append(int(row["id"]))
+        except sqlite3.OperationalError as exc:
+            if _is_lock_error(exc):
+                raise StorageUnavailableError(
+                    "数据库正忙，读取超时，整单未生效，请稍后重试"
+                ) from exc
+            raise
 
-            conn.execute(
-                "UPDATE areas SET version = version + 1 WHERE id = ?", (area["id"],)
-            )
-            new_site_version = _bump_site_version(conn)
-            conn.execute(
-                "UPDATE batches SET site_version = ? WHERE id = ?",
-                (new_site_version, batch_id),
-            )
-
-            return {
-                "batch_id": batch_id,
-                "area_code": area_code,
-                "base_version": base_version,
-                "area_version": current_version + 1,
-                "site_version": new_site_version,
-                "note": note,
-                "created_at": now,
-                "additions": _fetch_records_by_ids(conn, added_ids),
-                "withdrawals": _fetch_records_by_ids(conn, withdrawn_ids),
-                "effective_relation_count": len(edges),
-            }
-    except sqlite3.IntegrityError as exc:
-        raise ConflictError(
-            "数据唯一性或外键约束冲突，整批未生效", detail=str(exc)
-        ) from exc
-    except sqlite3.OperationalError as exc:
-        if _is_lock_error(exc):
-            raise StorageUnavailableError(
-                "数据库正忙，等待写锁超时，整单未生效，请稍后重试"
+        try:
+            with write_transaction(db, busy_timeout_ms) as write_conn:
+                return _apply_prepared(
+                    write_conn, prepared, note=note, now=now
+                )
+        except _SnapshotChanged:
+            # Another area published first: re-read and overlay its records.
+            continue
+        except sqlite3.IntegrityError as exc:
+            raise ConflictError(
+                "数据唯一性或外键约束冲突，整批未生效", detail=str(exc)
             ) from exc
-        raise
+        except sqlite3.OperationalError as exc:
+            if _is_lock_error(exc):
+                raise StorageUnavailableError(
+                    "数据库正忙，等待写锁超时，整单未生效，请稍后重试"
+                ) from exc
+            raise
+
+    raise StorageUnavailableError(
+        "同时发布了太多变更，未能取得一致快照，整单未生效，请稍后重试"
+    )
 
 
 def get_batch(db: DB, batch_id: int, busy_timeout_ms: int) -> dict[str, Any]:

@@ -4,7 +4,8 @@ The service deliberately uses the standard-library ``sqlite3`` module with
 explicit transactions so the concurrency rules are visible:
 
 * reads run inside a deferred transaction (a WAL snapshot);
-* every publish runs inside ``BEGIN IMMEDIATE``;
+* batch validation and the site-wide cycle check use a read snapshot only;
+* the short publish step runs inside ``BEGIN IMMEDIATE``;
 * failures roll back everything, leaving the previous published state intact.
 """
 
@@ -131,9 +132,11 @@ def write_transaction(
 ) -> Iterator[sqlite3.Connection]:
     """Yield a connection holding SQLite's write lock.
 
-    ``BEGIN IMMEDIATE`` acquires the lock before any read used for the
-    version check, which is what makes concurrent same-area submissions
-    deterministic.  Any exception rolls the whole transaction back.
+    ``BEGIN IMMEDIATE`` acquires the lock up front, so the version and
+    snapshot re-checks made by the caller and the writes that follow cannot be
+    interleaved with another publisher.  Callers are expected to have done the
+    expensive reads and graph analysis beforehand; keep the critical section
+    short.  Any exception rolls the whole transaction back.
     """
 
     conn = connect(db_path, busy_timeout_ms)
