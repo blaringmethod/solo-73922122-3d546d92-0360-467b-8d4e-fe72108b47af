@@ -1,0 +1,25 @@
+services:
+  stratigraphy:
+    build: .
+    image: stratigraphy-ranks:local
+    container_name: stratigraphy-ranks
+    ports:
+      - "8000:8000"
+    environment:
+      STRAT_DB_PATH: /data/strat.db
+      STRAT_SEED_DEMO: "true"
+      STRAT_BUSY_TIMEOUT_MS: "10000"
+    volumes:
+      - strat-data:/data
+    restart: unless-stopped
+
+  tests:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    profiles: ["test"]
+    environment:
+      PYTHONPATH: /app
+
+volumes:
+  strat-data:
